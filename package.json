@@ -45,6 +45,7 @@
     "typescript-transform-paths": "^3.5.5"
   },
   "dependencies": {
+    "@legal-atlas/database": "workspace:*",
     "@langchain/anthropic": "^0.3.27",
     "@langchain/core": "^0.3.75",
     "@langchain/langgraph": "^0.4.9",

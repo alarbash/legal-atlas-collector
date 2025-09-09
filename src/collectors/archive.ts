@@ -3,11 +3,23 @@ import logger from "~/logger";
 import { z } from "zod";
 import { createWriteStream } from "fs";
 import { pipeline } from "stream/promises";
+import { db } from "~/db";
+import { v4 as uuidv4 } from "uuid";
 
 // interface File {
 //   name: string;
 //   size: number;
 // }
+
+export class DuplicateError extends Error {
+  public id?: string;
+  
+  constructor(message: string, id?: string) {
+    super(message);
+    this.name = "DuplicateError";
+    this.id = id;
+  }
+}
 
 const fileSchema = z.object({
   name: z.string(),
@@ -74,19 +86,69 @@ const archiveResponseSchema = z.object({
 export type File = z.infer<typeof fileSchema>;
 export type ArchiveResponse = z.infer<typeof archiveResponseSchema>;
 
+const configSchema = z.object({
+  url: z.string().url().refine((val) => {
+    return /^https:\/\/archive\.org\/(details|metadata)\/[^/]+$/.test(val);
+  }, "Invalid Archive.org URL"),
+}).strict();
+
+type Config = z.infer<typeof configSchema>;
+
 export class ArchiveOrgCollector {
   baseUrl = "https://archive.org";
+  validUrlRegex = /^https:\/\/archive\.org\/(details|metadata)\/[^/]+$/;
   axiosInstance = axios.create({
     baseURL: this.baseUrl,
     timeout: 10000,
   });
+
+  public validateConfig(config: unknown): Config | null {
+    const parsed = configSchema.safeParse(config);
+    return parsed.success ? parsed.data : null;
+  }
+
+  public async createSource(config: unknown) {
+    const parsedConfig = this.validateConfig(config);
+    if (!parsedConfig) {
+      throw new Error("Invalid configuration for archive.org files");
+    }
+
+    const exists = await db.documentSource.findFirst({
+      where: {
+        type: "archive.org files",
+        config: {
+          path: ["url"],
+          equals: parsedConfig.url,
+        },
+      },
+    });
+
+    if (exists) {
+      throw new DuplicateError("Data source already exists", exists.id);
+    }
+
+    const newSource = await db.documentSource.create({
+      data: {
+        type: "archive.org files",
+        config: parsedConfig,
+      },
+    });
+
+    return newSource;
+  }
 
   private getIdentifierFromUrl(url: string): string | null {
     const match = url.match(/https:\/\/archive\.org\/details\/([^/]+)/);
     return match ? match[1] : null;
   }
 
-  async fetchFiles(url: string): Promise<File[]> {
+  async fetchFiles(config: unknown): Promise<File[]> {
+    const parsed = configSchema.safeParse(config);
+    if (!parsed.success) {
+      throw new Error(`Invalid configuration: ${parsed.error.message}`);
+    }
+
+    const { url } = parsed.data;
     const response = await this.getArchiveData(url);
     return response.files;
   }
@@ -163,48 +225,18 @@ export class ArchiveOrgCollector {
     }
   }
 
-  async downloadMultipleFiles(
-    url: string,
-    fileFilter: (file: File) => boolean,
-    outputDir: string,
-  ): Promise<string[]> {
-    const archiveData = await this.getArchiveData(url);
-    const filesToDownload = archiveData.files.filter(fileFilter);
-    const downloadedFiles: string[] = [];
-
-    logger.info("Starting batch download", {
-      totalFiles: filesToDownload.length,
-      outputDir,
-    });
-
-    for (const file of filesToDownload) {
-      const outputPath = `${outputDir}/${file.name}`;
-      try {
-        await this.downloadFile(archiveData, file.name, outputPath);
-        downloadedFiles.push(outputPath);
-      } catch (error) {
-        logger.error("Failed to download file in batch", {
-          fileName: file.name,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        // Continue with other files instead of failing the entire batch
-      }
-    }
-
-    logger.info("Batch download completed", {
-      totalFiles: filesToDownload.length,
-      successfulDownloads: downloadedFiles.length,
-      failedDownloads: filesToDownload.length - downloadedFiles.length,
-    });
-
-    return downloadedFiles;
-  }
-
-  async downloadFilesFromUrl(
-    url: string,
+  async downloadFiles(
+    sourceId: string,
+    config: unknown,
     outputDir: string,
     fileFilter?: (file: File) => boolean,
   ): Promise<{ successful: string[]; failed: string[] }> {
+    const parsed = configSchema.safeParse(config);
+    if (!parsed.success) {
+      throw new Error(`Invalid configuration: ${parsed.error.message}`);
+    }
+
+    const { url } = parsed.data;
     const archiveData = await this.getArchiveData(url);
     const files = fileFilter
       ? archiveData.files.filter(fileFilter)
@@ -219,10 +251,13 @@ export class ArchiveOrgCollector {
     });
 
     for (const file of files) {
-      const outputPath = `${outputDir}/${file.name}`;
+      const fileName = `${uuidv4()}.${file.name.split('.').pop()}`;
+      const outputPath = `${outputDir}/${fileName}`;
+
+      let documentId: string | null = null;
 
       try {
-        logger.info(
+        logger.debug(
           `Downloading file ${successful.length + failed.length + 1}/${files.length}`,
           {
             fileName: file.name,
@@ -231,15 +266,34 @@ export class ArchiveOrgCollector {
           },
         );
 
+        const document = await db.document.create({
+          data: {
+            sourceId: sourceId,
+            path: outputPath,
+            status: "DOWNLOADING",
+          }
+        })
+
+        documentId = document.id;
+
         await this.downloadFile(archiveData, file.name, outputPath);
         successful.push(outputPath);
 
-        logger.info("File downloaded successfully", {
+        logger.debug("File downloaded successfully", {
           fileName: file.name,
           outputPath,
         });
+
+        await db.document.update({
+          where: { id: documentId },
+          data: { status: "READY" },
+        })
       } catch (error) {
-        failed.push(file.name);
+        await db.document.update({
+          where: { id: documentId! },
+          data: { status: "ERROR" },
+        })
+
         logger.error("Failed to download file", {
           fileName: file.name,
           error: error instanceof Error ? error.message : String(error),
